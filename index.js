@@ -26,11 +26,29 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || 'admin@clutchlab.com').trim().toLowerCase();
 
 const allowedOrigins = CORS_ORIGIN.split(',').map((v) => v.trim()).filter(Boolean);
+
+function isLocalOrLanOrigin(origin) {
+  try {
+    const { hostname } = new URL(origin);
+    if (!hostname) return false;
+    if (hostname === 'localhost' || hostname === '127.0.0.1') return true;
+    return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+const allowAnyOrigin = allowedOrigins.includes('*');
+const normalizedAllowedOrigins = new Set(allowedOrigins.map((v) => v.toLowerCase()));
+
 app.use(
   cors({
     origin(origin, callback) {
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
+      const normalizedOrigin = String(origin).toLowerCase();
+      if (allowAnyOrigin || normalizedAllowedOrigins.has(normalizedOrigin) || isLocalOrLanOrigin(origin)) {
+        return callback(null, true);
+      }
       return callback(new Error(`CORS blocked for origin: ${origin}`));
     },
   })
@@ -224,8 +242,8 @@ const DEFAULT_PRICING_DOC = {
   _id: 'pricing',
   standard: { base: 49, pro: 119, elite: 119 },
   tiers: {
-    member: { monthly: 49, daily: 119 },
-    nonMember: { monthly: 49, daily: 119 },
+    member: { monthly: 49, membership: 49, daily: 119 },
+    nonMember: { monthly: 49, membership: 49, daily: 119 },
   },
   sessionDefaults: {
     member: { ...DEFAULT_SESSION_TIER },
@@ -266,6 +284,8 @@ function mapUser(u) {
     hasAccess: Boolean(u.hasAccess),
     access: u.access || {},
     isWalkInClient: Boolean(u.isWalkInClient),
+    lastMemberCategory: u.lastMemberCategory || null,
+    lastPlanType: u.lastPlanType || null,
     sessionsRemaining: typeof sr === 'number' && Number.isFinite(sr) ? sr : null,
     createdAt: u.createdAt || null,
     updatedAt: u.updatedAt || null,
@@ -293,6 +313,15 @@ function mapPayment(p) {
     createdAt: p.createdAt || null,
     updatedAt: p.updatedAt || null,
     paidAt: p.paidAt || null,
+    walkInDiscountApplied: Boolean(p.walkInDiscountApplied),
+    walkInRegularAmount:
+      typeof p.walkInRegularAmount === 'number' && Number.isFinite(p.walkInRegularAmount)
+        ? p.walkInRegularAmount
+        : null,
+    walkInDiscountedAmount:
+      typeof p.walkInDiscountedAmount === 'number' && Number.isFinite(p.walkInDiscountedAmount)
+        ? p.walkInDiscountedAmount
+        : null,
   };
 }
 
@@ -328,6 +357,8 @@ app.post('/api/auth/signup', async (req, res) => {
       waiverAccepted,
       hasAccess: false,
       access: {},
+      lastMemberCategory: 'non-member',
+      lastPlanType: null,
       createdAt: now(),
       updatedAt: now(),
     };
@@ -407,22 +438,42 @@ app.post('/api/payments/request', authRequired, async (req, res) => {
   const standard = pricing.standard || {};
   const tiers = pricing.tiers || {};
   const plan = String(courseId || '').toLowerCase();
-  if (plan === 'walkin' || plan === 'walk-in') {
-    return res.status(400).json({ error: 'Walk-in plan is no longer available.' });
+  const isWalkInPlan = plan === 'daily' || plan === 'walkin' || plan === 'walk-in';
+  const requestedCategory = String(formData?.memberCategory || '').trim().toLowerCase();
+  let memberCategory = requestedCategory;
+  if (plan === 'monthly') {
+    const lockedCategory = await resolveLockedMemberCategory({
+      userId: req.auth.uid,
+      customerIdInput: formData?.customerId,
+    });
+    if (lockedCategory === 'member' || lockedCategory === 'non-member') {
+      memberCategory = lockedCategory;
+    }
   }
-  const memberCategory = String(formData?.memberCategory || '').trim().toLowerCase();
-  const tierKey = memberCategory === 'non-member' ? 'nonMember' : 'member';
+  let tierKey = memberCategory === 'non-member' ? 'nonMember' : 'member';
+  let walkInQuote = null;
+  if (isWalkInPlan) {
+    walkInQuote = await resolveWalkInQuoteForUser({
+      userId: req.auth.uid,
+      pricing,
+      customerIdInput: formData?.customerId,
+    });
+    tierKey = walkInQuote.tierKey;
+  }
   const tier = tiers?.[tierKey] || {};
   const amountMap = {
     daily: Number(standard.elite || 119),
     weekly: Number(standard.pro || standard.elite || 119),
     monthly: Number(standard.base || 49),
+    membership: Number(tier?.membership || tier?.monthly || standard.base || 49),
     base: Number(standard.base || 49),
     pro: Number(standard.pro || standard.elite || 119),
     elite: Number(standard.elite || 119),
   };
   const tierPrice = Number(tier?.[plan]);
-  const baseFromTier = Number((Number.isFinite(tierPrice) && tierPrice > 0 ? tierPrice : amountMap[plan]) || 80);
+  const baseFromTier = isWalkInPlan
+    ? Number(walkInQuote?.amount || 0)
+    : Number((Number.isFinite(tierPrice) && tierPrice > 0 ? tierPrice : amountMap[plan]) || 80);
   const sdNorm = normalizeSessionDefaults(pricing.sessionDefaults || {});
   const tierSessions = tierKey === 'nonMember' ? sdNorm.nonMember : sdNorm.member;
 
@@ -430,6 +481,7 @@ app.post('/api/payments/request', authRequired, async (req, res) => {
 
   function defaultSessionsForPlan() {
     if (plan === 'monthly') return tierSessions.monthly;
+    if (plan === 'membership') return tierSessions.monthly;
     if (plan === 'daily') return tierSessions.daily;
     if (plan === 'weekly' || plan === 'pro') return tierSessions.daily;
     return 1;
@@ -445,6 +497,11 @@ app.post('/api/payments/request', authRequired, async (req, res) => {
   if (isAdmin && Number.isFinite(formAmt) && formAmt > 0) {
     resolvedAmount = formAmt;
   }
+
+  const walkInMemberCategory = walkInQuote?.eligibleForReturningDiscount
+    ? 'Returning Member (Walk-in Discount)'
+    : 'Walk-in Client';
+
   const paymentId = generateReferenceNumber({ userId: req.auth.uid, plan: courseId });
   await db.collection('payments').insertOne({
     _id: paymentId,
@@ -455,18 +512,64 @@ app.post('/api/payments/request', authRequired, async (req, res) => {
     title: `${courseId} membership`,
     amount: resolvedAmount,
     planType: formData.planType || null,
-    memberCategory: formData.memberCategory || null,
+    memberCategory: isWalkInPlan ? walkInMemberCategory : memberCategory || null,
     paymentMethod: formData.paymentMethod || 'Cash',
     startDate: formData.startDate || null,
     endDate: formData.endDate || null,
     sessions,
     status: 'pending',
+    walkInDiscountApplied: Boolean(walkInQuote?.eligibleForReturningDiscount),
+    walkInRegularAmount: walkInQuote?.regularAmount || null,
+    walkInDiscountedAmount: walkInQuote?.discountedAmount || null,
     provider: { gateway: 'manual' },
     submittedAt: now(),
     createdAt: now(),
     updatedAt: now(),
   });
-  return res.json({ paymentId, status: 'pending', amount: resolvedAmount });
+  return res.json({
+    paymentId,
+    status: 'pending',
+    amount: resolvedAmount,
+    memberCategoryLocked: plan === 'monthly' ? memberCategory : null,
+    walkInEligibleForReturningDiscount: Boolean(walkInQuote?.eligibleForReturningDiscount),
+    walkInRegularAmount: walkInQuote?.regularAmount || null,
+    walkInDiscountedAmount: walkInQuote?.discountedAmount || null,
+  });
+});
+
+app.post('/api/payments/member-category-quote', authRequired, async (req, res) => {
+  try {
+    const lockedCategory = await resolveLockedMemberCategory({
+      userId: req.auth.uid,
+      customerIdInput: req.body?.customerId,
+    });
+    return res.json({
+      memberCategory: lockedCategory || null,
+      lock: Boolean(lockedCategory),
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || 'Failed to resolve member category.' });
+  }
+});
+
+app.post('/api/payments/walkin-quote', authRequired, async (req, res) => {
+  try {
+    const pricing = await getPricingSettings();
+    const quote = await resolveWalkInQuoteForUser({
+      userId: req.auth.uid,
+      pricing,
+      customerIdInput: req.body?.customerId,
+    });
+    return res.json({
+      amount: quote.amount,
+      regularAmount: quote.regularAmount,
+      discountedAmount: quote.discountedAmount,
+      eligibleForReturningDiscount: quote.eligibleForReturningDiscount,
+      tierKey: quote.tierKey,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || 'Failed to quote walk-in price.' });
+  }
 });
 
 app.post('/api/payments/:id/mark-paid', authRequired, adminRequired, async (req, res) => {
@@ -495,7 +598,16 @@ app.post('/api/payments/:id/mark-paid', authRequired, adminRequired, async (req,
               [`access.${payment.courseId || 'plan'}`]: true,
               sessionsRemaining,
               lastPlanType: payment.planType || null,
-              lastMemberCategory: payment.memberCategory || null,
+              ...(function buildCategoryUpdate() {
+                const planKey = inferPaymentPlanKey(payment);
+                // Only paid monthly/membership can change membership tier.
+                if (planKey === 'monthly') {
+                  return {
+                    lastMemberCategory: isNonMemberCategory(payment.memberCategory) ? 'non-member' : 'member',
+                  };
+                }
+                return {};
+              })(),
               membershipEndDate: payment.endDate || null,
               updatedAt: now(),
             },
@@ -511,6 +623,192 @@ function parsePaymentEndMs(endDate) {
   if (!endDate) return null;
   const ms = Date.parse(String(endDate).trim());
   return Number.isFinite(ms) ? ms : null;
+}
+
+function normalizePlanKey(value) {
+  const v = String(value || '')
+    .trim()
+    .toLowerCase();
+  if (!v) return null;
+  if (v === 'base') return 'monthly';
+  if (v === 'pro') return 'weekly';
+  if (v === 'elite') return 'daily';
+  if (v === 'walk-in') return 'walkin';
+  if (v === 'walkin') return 'walkin';
+  if (v.includes('walk-in') || v.includes('walk in')) return 'walkin';
+  if (v.includes('daily')) return 'daily';
+  if (v.includes('weekly')) return 'weekly';
+  if (v.includes('monthly') || v.includes('membership')) return 'monthly';
+  return null;
+}
+
+function inferPaymentPlanKey(payment) {
+  return (
+    normalizePlanKey(payment?.courseId) ||
+    normalizePlanKey(payment?.plan) ||
+    normalizePlanKey(payment?.planType) ||
+    null
+  );
+}
+
+function resolveMembershipEndMs(payment) {
+  const explicitEnd = parsePaymentEndMs(payment?.endDate);
+  if (Number.isFinite(explicitEnd)) return explicitEnd;
+
+  const planKey = inferPaymentPlanKey(payment);
+  if (planKey !== 'monthly') return null;
+
+  const paidMs =
+    parsePaymentEndMs(payment?.paidAt) ||
+    parsePaymentEndMs(payment?.updatedAt) ||
+    parsePaymentEndMs(payment?.createdAt) ||
+    parsePaymentEndMs(payment?.submittedAt);
+  if (!Number.isFinite(paidMs)) return null;
+
+  return paidMs + 30 * 24 * 60 * 60 * 1000;
+}
+
+function normalizeMemberCategoryValue(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase();
+}
+
+function isNonMemberCategory(value) {
+  const v = normalizeMemberCategoryValue(value);
+  if (!v) return false;
+  return (
+    v === 'non-member' ||
+    v === 'non member' ||
+    v === 'walk-in client' ||
+    v === 'walk in client' ||
+    v.includes('non-member') ||
+    v.includes('walk-in client') ||
+    v.includes('walk in client')
+  );
+}
+
+function hasMemberPricingEligibility(payments) {
+  return (payments || []).some((p) => {
+    if (String(p?.status || '').toLowerCase() !== 'paid') return false;
+    const memberCategory = normalizeMemberCategoryValue(p?.memberCategory);
+
+    // If category is available, use it directly.
+    if (memberCategory) return !isNonMemberCategory(memberCategory);
+
+    // Legacy fallback: paid monthly plans are treated as member records.
+    return inferPaymentPlanKey(p) === 'monthly';
+  });
+}
+
+function categoryFromPaymentHistory(payments) {
+  const paid = (payments || [])
+    .filter((p) => String(p?.status || '').toLowerCase() === 'paid')
+    .sort((a, b) => {
+      const am = Date.parse(String(a?.paidAt || a?.updatedAt || a?.createdAt || 0));
+      const bm = Date.parse(String(b?.paidAt || b?.updatedAt || b?.createdAt || 0));
+      return (Number.isFinite(bm) ? bm : 0) - (Number.isFinite(am) ? am : 0);
+    });
+  if (!paid.length) return null;
+
+  for (const p of paid) {
+    const mc = normalizeMemberCategoryValue(p?.memberCategory);
+    if (!mc) continue;
+    return isNonMemberCategory(mc) ? 'non-member' : 'member';
+  }
+
+  return hasMemberPricingEligibility(paid) ? 'member' : null;
+}
+
+async function resolveLockedMemberCategory({ userId, customerIdInput }) {
+  const usersCollection = db.collection('users');
+  const paymentsCollection = db.collection('payments');
+
+  const candidateUids = new Set();
+  const candidateCustomerIds = new Set();
+  const uid = String(userId || '').trim();
+
+  const rawCustomerId = String(customerIdInput || '').trim();
+  if (!rawCustomerId && uid) candidateUids.add(uid);
+  if (rawCustomerId) candidateCustomerIds.add(rawCustomerId);
+  const normalizedInputId = normalizeMemberIdValue(rawCustomerId);
+  for (const v of customerIdLookupVariants(normalizedInputId)) {
+    candidateCustomerIds.add(v);
+    candidateCustomerIds.add(v.toUpperCase());
+  }
+
+  if (rawCustomerId) {
+    const userByCustomer = await findMemberUserByCustomerIdInput(usersCollection, rawCustomerId);
+    const matchedUid = String(userByCustomer?._id || '').trim();
+    if (matchedUid) candidateUids.add(matchedUid);
+    const matchedCustomerId = String(userByCustomer?.customerId || '').trim();
+    if (matchedCustomerId) {
+      candidateCustomerIds.add(matchedCustomerId);
+      const normalizedMatchedId = normalizeMemberIdValue(matchedCustomerId);
+      for (const v of customerIdLookupVariants(normalizedMatchedId)) {
+        candidateCustomerIds.add(v);
+        candidateCustomerIds.add(v.toUpperCase());
+      }
+    }
+  }
+
+  for (const candidateUid of candidateUids) {
+    const paidHistory = await paymentsCollection
+      .find({ userId: candidateUid, status: 'paid' })
+      .sort({ paidAt: -1, updatedAt: -1, createdAt: -1 })
+      .limit(120)
+      .toArray();
+    const resolved = categoryFromPaymentHistory(paidHistory);
+    if (resolved) return resolved;
+  }
+
+  if (candidateCustomerIds.size) {
+    const paidByCustomerId = await paymentsCollection
+      .find({
+        status: 'paid',
+        customerId: { $in: Array.from(candidateCustomerIds) },
+      })
+      .sort({ paidAt: -1, updatedAt: -1, createdAt: -1 })
+      .limit(120)
+      .toArray();
+    const resolved = categoryFromPaymentHistory(paidByCustomerId);
+    if (resolved) return resolved;
+  }
+
+  return null;
+}
+
+async function resolveWalkInQuoteForUser({ userId, pricing, customerIdInput }) {
+  const tiers = pricing?.tiers || {};
+  const standard = pricing?.standard || {};
+
+  const nonMemberDaily = Number(tiers?.nonMember?.daily);
+  const memberDaily = Number(tiers?.member?.daily);
+  const standardDaily = Number(standard?.elite);
+
+  const regularAmount =
+    (Number.isFinite(nonMemberDaily) && nonMemberDaily > 0 ? nonMemberDaily : null) ||
+    (Number.isFinite(standardDaily) && standardDaily > 0 ? standardDaily : null) ||
+    100;
+  const configuredDiscounted = Number.isFinite(memberDaily) && memberDaily > 0 ? memberDaily : null;
+  const discountedAmount =
+    configuredDiscounted && configuredDiscounted < regularAmount
+      ? configuredDiscounted
+      : Math.max(1, regularAmount - 20);
+
+  const lockedCategory = await resolveLockedMemberCategory({
+    userId,
+    customerIdInput,
+  });
+  const eligibleForReturningDiscount = lockedCategory === 'member';
+
+  return {
+    amount: eligibleForReturningDiscount ? discountedAmount : regularAmount,
+    regularAmount,
+    discountedAmount,
+    eligibleForReturningDiscount,
+    tierKey: eligibleForReturningDiscount ? 'member' : 'nonMember',
+  };
 }
 
 /** Public: member enters Customer ID; each call deducts 1 session if balance > 0, returns plan stats. */
@@ -605,21 +903,28 @@ app.put('/api/settings/pricing', authRequired, adminRequired, async (req, res) =
   const nonMemberTier = payload?.tiers?.nonMember || {};
   const sessionDefaults = normalizeSessionDefaults(payload?.sessionDefaults || {});
   const memberDaily = Number(memberTier.daily || payload?.standard?.elite || 119);
+  const memberMonthly = Number(memberTier.monthly || payload?.standard?.base || 49);
+  const memberMembership = Number(memberTier.membership || memberMonthly);
+  const nonMemberDaily = Number(nonMemberTier.daily || payload?.standard?.elite || 119);
+  const nonMemberMonthly = Number(nonMemberTier.monthly || payload?.standard?.base || 49);
+  const nonMemberMembership = Number(nonMemberTier.membership || nonMemberMonthly);
   const doc = {
     _id: 'pricing',
     standard: {
-      base: Number(memberTier.monthly || payload?.standard?.base || 49),
+      base: memberMonthly,
       pro: Number(memberTier.daily || payload?.standard?.pro || memberDaily),
       elite: Number(memberTier.daily || payload?.standard?.elite || 119),
     },
     tiers: {
       member: {
-        monthly: Number(memberTier.monthly || payload?.standard?.base || 49),
-        daily: Number(memberTier.daily || payload?.standard?.elite || 119),
+        monthly: memberMonthly,
+        membership: memberMembership,
+        daily: memberDaily,
       },
       nonMember: {
-        monthly: Number(nonMemberTier.monthly || payload?.standard?.base || 49),
-        daily: Number(nonMemberTier.daily || payload?.standard?.elite || 119),
+        monthly: nonMemberMonthly,
+        membership: nonMemberMembership,
+        daily: nonMemberDaily,
       },
     },
     sessionDefaults,
@@ -647,6 +952,8 @@ app.post('/api/admin/walkin', authRequired, adminRequired, async (req, res) => {
         role: 'member',
         isWalkInClient: true,
         hasAccess: true,
+        lastMemberCategory: 'non-member',
+        lastPlanType: 'Walk-in',
         updatedAt: now(),
       },
       $setOnInsert: { createdAt: now() },
@@ -704,6 +1011,8 @@ app.post('/api/admin/members', authRequired, adminRequired, async (req, res) => 
     passwordHash,
     hasAccess: false,
     access: {},
+    lastMemberCategory: 'non-member',
+    lastPlanType: null,
     createdAt: now(),
     updatedAt: now(),
   });
