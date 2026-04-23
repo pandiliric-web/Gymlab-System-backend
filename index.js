@@ -7,14 +7,11 @@ const { MongoClient, ObjectId } = require('mongodb');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 
-// Load backend env vars. Prefer .env.local (developer machine) then fallback to .env.
+// Load backend env vars. Base .env first, then .env.local overrides for local dev.
 const envLocalPath = path.join(__dirname, '.env.local');
 const envPath = path.join(__dirname, '.env');
-if (fs.existsSync(envLocalPath)) {
-  dotenv.config({ path: envLocalPath, override: true });
-} else {
-  dotenv.config({ path: envPath, override: true });
-}
+if (fs.existsSync(envPath)) dotenv.config({ path: envPath, override: false });
+if (fs.existsSync(envLocalPath)) dotenv.config({ path: envLocalPath, override: true });
 
 const app = express();
 
