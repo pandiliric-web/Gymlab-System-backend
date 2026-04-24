@@ -438,7 +438,7 @@ app.post('/api/payments/request', authRequired, async (req, res) => {
   const isWalkInPlan = plan === 'daily' || plan === 'walkin' || plan === 'walk-in';
   const requestedCategory = String(formData?.memberCategory || '').trim().toLowerCase();
   let memberCategory = requestedCategory;
-  if (plan === 'monthly') {
+  if (plan === 'monthly' || plan === 'membership') {
     const lockedCategory = await resolveLockedMemberCategory({
       userId: req.auth.uid,
       customerIdInput: formData?.customerId,
@@ -527,7 +527,7 @@ app.post('/api/payments/request', authRequired, async (req, res) => {
     paymentId,
     status: 'pending',
     amount: resolvedAmount,
-    memberCategoryLocked: plan === 'monthly' ? memberCategory : null,
+    memberCategoryLocked: plan === 'monthly' || plan === 'membership' ? memberCategory : null,
     walkInEligibleForReturningDiscount: Boolean(walkInQuote?.eligibleForReturningDiscount),
     walkInRegularAmount: walkInQuote?.regularAmount || null,
     walkInDiscountedAmount: walkInQuote?.discountedAmount || null,
@@ -573,9 +573,22 @@ app.post('/api/payments/:id/mark-paid', authRequired, adminRequired, async (req,
   const paymentId = String(req.params.id || '').trim();
   const payment = await db.collection('payments').findOne({ _id: paymentId });
   if (!payment) return res.status(404).json({ error: 'Payment not found.' });
+  const rawCourseId = String(payment.courseId || payment.plan || payment.planType || '')
+    .trim()
+    .toLowerCase();
+  const isMembershipPurchase = rawCourseId.includes('membership');
+  const paidMemberCategory = isMembershipPurchase ? 'member' : payment.memberCategory;
   await db.collection('payments').updateOne(
     { _id: paymentId },
-    { $set: { status: 'paid', paidAt: now(), updatedAt: now(), provider: { ...(payment.provider || {}), manualConfirmed: true } } }
+    {
+      $set: {
+        status: 'paid',
+        paidAt: now(),
+        updatedAt: now(),
+        provider: { ...(payment.provider || {}), manualConfirmed: true },
+        memberCategory: paidMemberCategory || null,
+      },
+    }
   );
   if (payment.userId) {
     const sessionCount = Number(payment.sessions);
@@ -600,7 +613,7 @@ app.post('/api/payments/:id/mark-paid', authRequired, adminRequired, async (req,
                 // Only paid monthly/membership can change membership tier.
                 if (planKey === 'monthly') {
                   return {
-                    lastMemberCategory: isNonMemberCategory(payment.memberCategory) ? 'non-member' : 'member',
+                    lastMemberCategory: isNonMemberCategory(paidMemberCategory) ? 'non-member' : 'member',
                   };
                 }
                 return {};
@@ -734,8 +747,10 @@ async function resolveLockedMemberCategory({ userId, customerIdInput }) {
     candidateCustomerIds.add(v.toUpperCase());
   }
 
+  let matchedUserByCustomer = null;
   if (rawCustomerId) {
     const userByCustomer = await findMemberUserByCustomerIdInput(usersCollection, rawCustomerId);
+    matchedUserByCustomer = userByCustomer || null;
     const matchedUid = String(userByCustomer?._id || '').trim();
     if (matchedUid) candidateUids.add(matchedUid);
     const matchedCustomerId = String(userByCustomer?.customerId || '').trim();
@@ -770,6 +785,19 @@ async function resolveLockedMemberCategory({ userId, customerIdInput }) {
       .toArray();
     const resolved = categoryFromPaymentHistory(paidByCustomerId);
     if (resolved) return resolved;
+  }
+
+  // Fallback to user profile category so non-members are not treated as members by default.
+  if (matchedUserByCustomer) {
+    const profileCategory = normalizeMemberCategoryValue(matchedUserByCustomer.lastMemberCategory);
+    if (profileCategory) return isNonMemberCategory(profileCategory) ? 'non-member' : 'member';
+    return 'non-member';
+  }
+
+  for (const candidateUid of candidateUids) {
+    const profile = await usersCollection.findOne({ _id: candidateUid }, { projection: { lastMemberCategory: 1 } });
+    const profileCategory = normalizeMemberCategoryValue(profile?.lastMemberCategory);
+    if (profileCategory) return isNonMemberCategory(profileCategory) ? 'non-member' : 'member';
   }
 
   return null;
